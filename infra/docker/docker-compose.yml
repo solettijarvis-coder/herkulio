@@ -1,0 +1,159 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: herkulio-postgres
+    environment:
+      POSTGRES_USER: herkulio
+      POSTGRES_PASSWORD: herkulio_password
+      POSTGRES_DB: herkulio
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../database/migrations:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U herkulio"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - herkulio-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: herkulio-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - herkulio-network
+
+  # FastAPI Backend
+  api:
+    build:
+      context: ../backend
+      dockerfile: ../infra/docker/Dockerfile.api
+    container_name: herkulio-api
+    environment:
+      - DATABASE_URL=postgresql://herkulio:herkulio_password@postgres:5432/herkulio
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - ../config/.env
+    volumes:
+      - ../backend:/app
+      - investigation_data:/app/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - herkulio-network
+
+  # Celery Worker
+  worker:
+    build:
+      context: ../backend
+      dockerfile: ../infra/docker/Dockerfile.api
+    container_name: herkulio-worker
+    environment:
+      - DATABASE_URL=postgresql://herkulio:herkulio_password@postgres:5432/herkulio
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - ../config/.env
+    volumes:
+      - ../backend:/app
+      - investigation_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: celery -A api.worker worker --loglevel=info
+    networks:
+      - herkulio-network
+
+  # Celery Beat (scheduled tasks)
+  beat:
+    build:
+      context: ../backend
+      dockerfile: ../infra/docker/Dockerfile.api
+    container_name: herkulio-beat
+    environment:
+      - DATABASE_URL=postgresql://herkulio:herkulio_password@postgres:5432/herkulio
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - ../config/.env
+    volumes:
+      - ../backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: celery -A api.worker beat --loglevel=info
+    networks:
+      - herkulio-network
+
+  # Next.js Frontend
+  web:
+    build:
+      context: ../frontend
+      dockerfile: ../infra/docker/Dockerfile.web
+    container_name: herkulio-web
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    env_file:
+      - ../config/.env
+    volumes:
+      - ../frontend/app:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    command: npm run dev
+    networks:
+      - herkulio-network
+
+  # Telegram Bot (optional)
+  telegram:
+    build:
+      context: ../backend
+      dockerfile: ../infra/docker/Dockerfile.api
+    container_name: herkulio-telegram
+    environment:
+      - DATABASE_URL=postgresql://herkulio:herkulio_password@postgres:5432/herkulio
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - ../config/.env
+    volumes:
+      - ../backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: python -m osint.telegram_bot
+    networks:
+      - herkulio-network
+    profiles:
+      - with-telegram
+
+volumes:
+  postgres_data:
+  redis_data:
+  investigation_data:
+
+networks:
+  herkulio-network:
+    driver: bridge
