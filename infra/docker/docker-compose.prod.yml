@@ -1,0 +1,206 @@
+version: '3.8'
+
+# Production Docker Compose for VPS Deployment
+# SSL handled by nginx-proxy + acme-companion
+
+services:
+  # Reverse Proxy + SSL
+  nginx-proxy:
+    image: nginxproxy/nginx-proxy:alpine
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - nginx-certs:/etc/nginx/certs
+      - nginx-vhost:/etc/nginx/vhost.d
+      - nginx-html:/usr/share/nginx/html
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+  # Let's Encrypt SSL automation
+  acme-companion:
+    image: nginxproxy/acme-companion
+    container_name: acme-companion
+    environment:
+      - DEFAULT_EMAIL=admin@herkulio.com
+      - NGINX_PROXY_CONTAINER=nginx-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nginx-certs:/etc/nginx/certs
+      - nginx-vhost:/etc/nginx/vhost.d
+      - nginx-html:/usr/share/nginx/html
+      - acme-data:/etc/acme.sh
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: herkulio-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-herkulio}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme_strong_password}
+      POSTGRES_DB: ${DB_NAME:-herkulio}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../database/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-herkulio}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+  # Redis Cache & Queue
+  redis:
+    image: redis:7-alpine
+    container_name: herkulio-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+  # FastAPI Backend
+  api:
+    image: ghcr.io/solettijarvis-coder/herkulio/api:main
+    container_name: herkulio-api
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-herkulio}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-herkulio}
+      - REDIS_URL=redis://redis:6379/0
+      - VIRTUAL_HOST=api.herkulio.com
+      - VIRTUAL_PORT=8000
+      - LETSENCRYPT_HOST=api.herkulio.com
+      - LETSENCRYPT_EMAIL=admin@herkulio.com
+    env_file:
+      - ../config/.env.prod
+    volumes:
+      - api_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+  # Celery Worker
+  worker:
+    image: ghcr.io/solettijarvis-coder/herkulio/api:main
+    container_name: herkulio-worker
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-herkulio}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-herkulio}
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - ../config/.env.prod
+    volumes:
+      - api_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: celery -A api.worker worker --loglevel=info --concurrency=2
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+  # Celery Beat (scheduled tasks)
+  beat:
+    image: ghcr.io/solettijarvis-coder/herkulio/api:main
+    container_name: herkulio-beat
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-herkulio}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-herkulio}
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - ../config/.env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: celery -A api.worker beat --loglevel=info
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+  # Next.js Frontend
+  web:
+    image: ghcr.io/solettijarvis-coder/herkulio/web:main
+    container_name: herkulio-web
+    environment:
+      - NEXT_PUBLIC_API_URL=https://api.herkulio.com
+      - VIRTUAL_HOST=herkulio.com,www.herkulio.com
+      - VIRTUAL_PORT=3000
+      - LETSENCRYPT_HOST=herkulio.com,www.herkulio.com
+      - LETSENCRYPT_EMAIL=admin@herkulio.com
+    env_file:
+      - ../config/.env.prod
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+  # Telegram Bot (optional)
+  telegram:
+    image: ghcr.io/solettijarvis-coder/herkulio/api:main
+    container_name: herkulio-telegram
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-herkulio}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-herkulio}
+      - REDIS_URL=redis://redis:6379/0
+      - HERKULIO_API_URL=http://api:8000
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    env_file:
+      - ../config/.env.prod
+    volumes:
+      - api_data:/app/data
+    depends_on:
+      - api
+    command: python /app/osint/telegram_bot_prod.py
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+    profiles:
+      - with-telegram
+
+  # Database Backup
+  backup:
+    image: offen/docker-volume-backup:latest
+    container_name: herkulio-backup
+    environment:
+      BACKUP_CRON_EXPRESSION: "0 3 * * *"
+      BACKUP_RETENTION_DAYS: "30"
+      BACKUP_FILENAME: "herkulio-backup-%Y-%m-%dT%H-%M-%S.tar.gz"
+      AWS_S3_BUCKET_NAME: ${BACKUP_S3_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${BACKUP_AWS_KEY:-}
+      AWS_SECRET_ACCESS_KEY: ${BACKUP_AWS_SECRET:-}
+      AWS_DEFAULT_REGION: ${BACKUP_AWS_REGION:-us-east-1}
+    volumes:
+      - postgres_data:/backup/postgres:ro
+      - redis_data:/backup/redis:ro
+      - api_data:/backup/api:ro
+    restart: unless-stopped
+    networks:
+      - herkulio-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  api_data:
+  nginx-certs:
+  nginx-vhost:
+  nginx-html:
+  acme-data:
+
+networks:
+  herkulio-network:
+    driver: bridge
