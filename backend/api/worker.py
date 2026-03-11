@@ -26,15 +26,20 @@ celery_app.conf.update(
 )
 
 @celery_app.task(bind=True, max_retries=3)
-def run_investigation_task(self, investigation_id: str, target: str, target_type: str, depth: str, context: dict):
+def run_investigation_task(self, investigation_id: str, target: str, target_type: str, depth: str, context: dict, tenant_id: str = None):
     """
     Run an investigation asynchronously.
     
     This calls the herkulio_engine.py with proper tenant isolation.
+    Uses Herkulio's own memory system - completely separate from Jarvis.
     """
     try:
         # Update status to running
         # TODO: Update database
+        
+        # Import Herkulio's memory (not Jarvis's)
+        from osint.memory import get_memory
+        memory = get_memory(tenant_id)
         
         # Import and run the engine
         import sys
@@ -46,6 +51,24 @@ def run_investigation_task(self, investigation_id: str, target: str, target_type
             target_type=target_type,
             depth=depth,
             **context
+        )
+        
+        # Store entity in Herkulio's memory
+        entity_id = str(uuid.uuid4())
+        memory.store_entity(
+            entity_id=entity_id,
+            name=target,
+            entity_type=target_type,
+            data=result.get("raw_data", {}),
+            risk_score=result.get("risk_score")
+        )
+        
+        # Cache investigation for quick lookup
+        memory.cache_investigation(
+            investigation_id=investigation_id,
+            target=target,
+            risk_level=result.get("risk_level", "unknown"),
+            findings=result
         )
         
         # Save results to database

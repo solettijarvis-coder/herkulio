@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.main import get_db, get_current_tenant
 from api.worker import run_investigation_task
+from osint.memory import get_memory
 
 router = APIRouter()
 
@@ -52,11 +53,49 @@ async def create_investigation(
     """
     investigation_id = str(uuid.uuid4())
     
+    # Check Herkulio's own memory for prior investigations
+    memory = get_memory(tenant.get("tenant_id"))
+    prior = memory.check_prior_investigation(data.target)
+    
+    if prior:
+        # Return cached result if recent (< 7 days)
+        from datetime import timedelta
+        prior_date = datetime.fromisoformat(prior["created_at"])
+        if datetime.utcnow() - prior_date < timedelta(days=7):
+            return InvestigationResponse(
+                id=prior["investigation_id"],
+                target=data.target,
+                target_type=data.target_type,
+                status="completed",
+                risk_score=prior["findings"].get("risk_score"),
+                risk_level=prior["risk_level"],
+                created_at=prior_date
+            )
+    
     # TODO: Save to database
     # TODO: Check tenant quota
-    # TODO: Queue background task
+    # TODO: Queue background task with Herkulio's memory
     
-    # For now, return mock response
+    context = {
+        "email": data.email,
+        "phone": data.phone,
+        "url": data.url,
+        "state": data.state,
+        "country": data.country,
+        "city": data.city,
+        "notes": data.notes
+    }
+    
+    # Queue Celery task
+    run_investigation_task.delay(
+        investigation_id=investigation_id,
+        target=data.target,
+        target_type=data.target_type,
+        depth=data.depth,
+        context=context,
+        tenant_id=tenant.get("tenant_id")
+    )
+    
     return InvestigationResponse(
         id=investigation_id,
         target=data.target,
