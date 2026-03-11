@@ -12,7 +12,7 @@ Option B: Use existing JLC Ventures
 ## Step 2: Create Repository
 
 1. Go to https://github.com/new
-2. Repository name: `intelligence-platform`
+2. Repository name: `herkulio`
 3. Description: "Herkulio OSINT Intelligence SaaS Platform"
 4. Make it **Private** (for now)
 5. Don't initialize with README (we already have one)
