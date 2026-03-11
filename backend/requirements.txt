@@ -34,6 +34,9 @@ structlog==23.2.0
 # Stripe for billing
 stripe==7.8.0
 
+# JWT
+pyjwt==2.8.0
+
 # Testing (dev only)
 pytest==7.4.4
 pytest-asyncio==0.21.1
